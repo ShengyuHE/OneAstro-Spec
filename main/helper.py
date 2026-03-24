@@ -21,11 +21,13 @@ def _decode_array(arr):
     arr = np.asarray(arr)
     if arr.dtype.kind == "S":
         return arr.astype(str)
+    elif arr.dtype.kind == "U":
+        return arr
     elif arr.dtype == object:
         return np.array([x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in arr], dtype=str)
     else:
         return arr
-    
+
 def setup_logging(level=logging.INFO, stream=sys.stdout, filename=None, filemode='w', **kwargs):
     """
     Set up logging.

@@ -10,6 +10,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, Subset
     
 from helper import setup_logging, _decode_array
+from id_mask_tools import make_id_mask
 setup_logging()
 
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +32,9 @@ class SpecDataLoader:
     def __init__(self, name):
         self.name = name
         self.dataset = name
+        self._cache = {}
+        self._id_cache = {}
+        self._mask_cache = {}
 
     def _get_colnames(self, data):
         if hasattr(data, "colnames"):
@@ -48,24 +52,41 @@ class SpecDataLoader:
                 meta[f.lower()] = data[f]
         return meta
 
-    def load_data(self, name=None, columns=None, memmap=False):
+    def load_data(self, name=None, columns=None, id_sel=None, id_col="TARGETID", memmap=False):
         from astropy.table import Table
         from helper import READY_FILE
+        ## progbgs-full
         if name is None: name = self.name
         if name not in READY_FILE:
             raise ValueError(f"Dataset '{name}' not ready")
-        fn = READY_FILE[name]
-        ## TODO: add reading .h5 file
-        data = Table.read(fn, memmap=memmap)
+        if name not in self._cache:
+            fn = READY_FILE[name]
+            self._cache[name] = Table.read(fn, memmap=memmap)
+        data = self._cache[name]
+        # apply id selection
+        if id_sel is not None:
+            if id_col not in data.colnames:
+                raise KeyError(f"ID column '{id_col}' not found in data")
+            id_key = (name, id_col)
+            if id_key not in self._id_cache:
+                self._id_cache[id_key] = np.asarray(data[id_col])
+            ids = self._id_cache[id_key]
+            id_sel_arr = np.asarray(id_sel)
+            mask_key = (name, id_col, tuple(id_sel_arr.tolist()))
+            if mask_key not in self._mask_cache:
+                self._mask_cache[mask_key] = make_id_mask(ids, id_sel=id_sel_arr)
+            mask = self._mask_cache[mask_key]
+            data = data[mask]
+        # select columns
         if columns is not None:
             missing = [c for c in columns if c not in data.colnames]
             if missing: raise KeyError(f"Missing columns: {missing}")
             data = data[columns]
         return data
 
-    def chunk_data(self, batch_size=32, max_samples=None, data=None,):
+    def chunk_data(self, batch_size=32, max_samples=None, data=None, id_sel=None, id_col="TARGETID"):
         batches = []
-        if data is None: data = self.load_data()
+        if data is None: data = self.load_data(id_sel=id_sel, id_col=id_col)
         total_samples = len(data) if max_samples is None else min(max_samples, len(data))
         num_batches = (total_samples + batch_size - 1) // batch_size
         for batch_idx in range(num_batches):
@@ -173,25 +194,21 @@ class SpecFeatureExtractor:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             tokens = self.codec_manager.encode(*modality_list)
             # TODO: check the dimension of tokens
-            # Replace this with the correct AION feature API
-            features = self.model.encode(tokens)
+            features = self.model.encode(tokens, num_encoder_tokens=900)
+        # features = torch.cat(features, dim=0).cpu().numpy()     
         features = features.detach().float().cpu()
         return features
-    
+
 class SpecFeatureLoader:
     def __init__(self, dataset="provabgs-v2", loader=None, extractor=None):
         self.dataset = dataset
         self.loader = loader or SpecDataLoader(dataset)
         self.extractor = extractor or SpecFeatureExtractor()  
+        self._feature_cache = {}
+        self._feature_ids_cache = {}
+        self._dataset_ids_cache = {}
+        self._selection_cache = {}
 
-    def _make_id_mask(self, ids, id_sel=None):
-        if id_sel is None:
-            return np.ones(len(ids), dtype=bool)
-        ids = np.asarray(ids).astype(str)
-        id_sel = _decode_array(id_sel)
-        id_set = set(id_sel.tolist())
-        return np.array([x in id_set for x in ids], dtype=bool)
-    
     def _select_labels(self, ids, all_labels, all_label_names, label_names, label_dtype="auto"):
         if label_names is None:
             return None
@@ -207,69 +224,132 @@ class SpecFeatureLoader:
         labels = np.column_stack(cols)
         return _cast_labels(labels, label_dtype=label_dtype)
 
-    def load_features(self, kind=("desi_spectrum",), 
-                    label_names=("z",), label_dtype="auto",
-                    batch_size=30, max_samples=21870,
-                    feature_fn=None, id_sel=None,
-                    overwrite=False,):
+    def _id_sel_key(self, id_sel):
+        import hashlib
+        if id_sel is None:
+            return None
+        arr = np.asarray(id_sel)
+        if arr.dtype.kind == "U":
+            arr = arr.astype("S")
+        elif arr.dtype == object:
+            arr = arr.astype(str).astype("S")
+        return hashlib.md5(arr.tobytes()).hexdigest()
+
+    def _load_feature_file(self, feature_fn):
+        if feature_fn not in self._feature_cache:
+            logger.info(f"Reading feature file from disk: {feature_fn}")
+            cache = np.load(feature_fn, allow_pickle=True)
+            self._feature_cache[feature_fn] = {"features": cache["features"],
+                "ids": _decode_array(cache["ids"]).astype(str),
+                "labels": cache["labels"],
+                "label_names": list(cache["label_names"]),
+            }
+        else:
+            logger.info(f"Using in-memory feature cache: {feature_fn}")
+        return self._feature_cache[feature_fn]
+
+    def _get_selection_idx(self, id_sel=None, ref_ids=None):
+        if id_sel is None:
+            return slice(None)
+        if ref_ids is None:
+            if self.dataset not in self._dataset_ids_cache:
+                raise ValueError(f"No reference ids cached yet for dataset {self.dataset}")
+            ref_ids = self._dataset_ids_cache[self.dataset]
+        key = (self.dataset, self._id_sel_key(id_sel), self._id_sel_key(ref_ids))
+        if key not in self._selection_cache:
+            mask = make_id_mask(ref_ids, id_sel=id_sel)
+            self._selection_cache[key] = np.where(mask)[0]
+        return self._selection_cache[key]
+
+    def load_features(self, kind=("desi_spectrum",), label_names=("z",), label_dtype="auto",
+                    batch_size=30, max_samples=None, feature_fn=None, id_sel=None,overwrite=False,):
+        """
+        Load cached features or extract them from the full dataset.
+
+        Features are always computed and cached for the full dataset (without `id_sel`).
+        Any selection via `id_sel` is applied afterward in memory, ensuring that cached
+        feature files remain consistent and reusable across different masks.
+
+        Parameters
+        ----------
+        kind : tuple
+            Modalities used for feature extraction.
+        label_names : tuple
+            Names of labels to extract.
+        label_dtype : str
+            Data type for labels ("auto", "float", or "object").
+        batch_size : int
+            Batch size for feature extraction.
+        max_samples : int or None
+            Optional limit on number of samples after loading/extraction.
+        feature_fn : str or None
+            Path to cached feature file.
+        id_sel : array-like or None
+            Optional ID selection applied after loading/extraction.
+        overwrite : bool
+            If True, recompute features even if cache exists.
+            
+        Returns
+        -------
+        features : np.ndarray -- Feature array.
+        labels : np.ndarray -- Corresponding labels.
+        """
+
         if (feature_fn is not None) and (not os.path.exists(feature_fn)):
             logger.warning(f"{feature_fn} does not exist; extracting features from dataset")
         if feature_fn is not None and os.path.exists(feature_fn) and not overwrite:
-            logger.info(f"Loading cached features: {feature_fn}")
-            cache = np.load(feature_fn, allow_pickle=True)
+            # load cached features
+            cache = self._load_feature_file(feature_fn)
+            ids = cache["ids"]
             features = cache["features"]
-            ids = _decode_array(cache["ids"]).astype(str)
             all_labels = cache["labels"]
-            all_label_names = list(cache["label_names"])
-            mask_ids = self._make_id_mask(ids, id_sel=id_sel)
-            ids = ids[mask_ids]
-            features = features[mask_ids]
-            all_labels = all_labels[mask_ids]
-            labels = self._select_labels(ids, all_labels, all_label_names, label_names, label_dtype)
-            return features, labels
-        logger.info(f"Extract features for {self.dataset} {kind}")
-        data = self.loader.load_data()
-        if id_sel is not None:
-            data_ids = _decode_array(data["TARGETID"]).astype(str)
-            mask_ids = self._make_id_mask(data_ids, id_sel=id_sel)
-            data = data[mask_ids]
+            all_label_names = cache["label_names"]
+        else: 
+            # or extract from raw dataset
+            logger.info(f"Extract features for {self.dataset} {kind}")
+            data = self.loader.load_data(id_sel=None)
+            batches = self.loader.chunk_data(batch_size=batch_size, data=data)
+            all_features = []
+            all_targetid = []
+            all_labels = []
+            all_label_names = None
+            for i, batch in enumerate(tqdm(batches, desc="Feature Extraction", dynamic_ncols=True)):
+                # logger.info(modalities)
+                #  Features
+                modalities = self.extractor.build_modalities(batch, kind=kind)
+                features = self.extractor.extract_features(modalities, flatten=False)
+                all_features.append(features.detach().cpu().numpy().astype(np.float32))
+                # TARGETID
+                batch_targetid = _decode_array(batch["TARGETID"]).astype(str)
+                all_targetid.append(batch_targetid)
+                # labels
+                labels_dict = self.extractor.get_labels(batch, name=self.dataset, qu=None, as_tensor=False)
+                if all_label_names is None:
+                    all_label_names = list(labels_dict.keys())
+                label_array = np.column_stack([np.asarray(labels_dict[name], dtype=object) for name in all_label_names])
+                all_labels.append(label_array)
+                if i % 10 == 0:
+                    torch.cuda.empty_cache()
+            ids = np.concatenate(all_targetid)
+            features = np.vstack(all_features)
+            all_labels = np.vstack(all_labels)
+            self._dataset_ids_cache[self.dataset] = ids
+            if feature_fn is not None:
+                os.makedirs(os.path.dirname(feature_fn), exist_ok=True)
+                np.savez_compressed(feature_fn,  ids=ids, features=features,  labels=all_labels,  label_names=np.array(all_label_names, dtype=object))
+                logger.info(f"Save extracted features in: {feature_fn}")
+                self._feature_cache[feature_fn] = {"features": features, "ids": ids, "labels": all_labels, "label_names": list(all_label_names),}
+        row_idx = self._get_selection_idx(id_sel, ref_ids=ids)
+        if not isinstance(row_idx, slice):
+            ids = ids[row_idx]
+            features = features[row_idx]
+            all_labels = all_labels[row_idx]
         if max_samples is not None:
-            data = data[:max_samples]
-        batches = self.loader.chunk_data(batch_size=batch_size, data=data)
-        all_features = []
-        all_targetid = []
-        all_labels = []
-        all_label_names = None
-        for i, batch in enumerate(tqdm(batches, desc="Feature Extraction", dynamic_ncols=True)):
-            # logger.info(modalities)
-            #  Features
-            modalities = self.extractor.build_modalities(batch, kind=kind)
-            features = self.extractor.extract_features(modalities, flatten=False)
-            all_features.append(features.numpy().astype(np.float32))
-            # TARGETID
-            batch_targetid = _decode_array(batch["TARGETID"]).astype(str)
-            all_targetid.append(batch_targetid)
-            # labels
-            labels_dict = self.extractor.get_labels(batch, name=self.dataset, qu=None, as_tensor=False)
-            if all_label_names is None:
-                all_label_names = list(labels_dict.keys())
-            label_array = np.column_stack([np.asarray(labels_dict[name], dtype=object) for name in all_label_names])
-            all_labels.append(label_array)
-            if i % 10 == 0:
-                torch.cuda.empty_cache()
-        all_targetid = np.concatenate(all_targetid)
-        all_features = np.vstack(all_features)
-        all_labels = np.vstack(all_labels)
-        if feature_fn is not None:
-            os.makedirs(os.path.dirname(feature_fn), exist_ok=True)
-            np.savez_compressed(feature_fn, 
-                                ids=all_targetid,
-                                features=all_features, 
-                                labels=all_labels, 
-                                label_names=np.array(all_label_names, dtype=object))
-            logger.info(f"Save extracted features in: {feature_fn}")
-        labels = self._select_labels(all_targetid, all_labels, all_label_names, label_names, label_dtype)
-        return all_features, labels
+            ids = ids[:max_samples]
+            features = features[:max_samples]
+            all_labels = all_labels[:max_samples]
+        labels = self._select_labels(ids, all_labels, all_label_names, label_names, label_dtype)
+        return features, labels
 
     def update_feature_labels(self, feature_fn, label_names=("z",), saving=False):
         """
@@ -326,7 +406,6 @@ class SpecFeatureLoader:
             raise ValueError("feature_fn must be provided")
         if not os.path.exists(feature_fn):
             raise FileNotFoundError(f"Feature file does not exist: {feature_fn}")
-
 
 class FeatureDataset(Dataset):
     def __init__(self, features, labels, task="classification"):

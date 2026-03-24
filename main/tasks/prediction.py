@@ -2,6 +2,7 @@
 To activate enviroment
 conda activate SpecFun
 '''
+import gc
 import os, sys  
 ## set hugging face to off-line
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -11,6 +12,7 @@ import json
 import copy
 import logging
 import argparse
+import itertools
 import numpy as np
 from tqdm import tqdm
 
@@ -19,8 +21,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-sys.path.append("..")
+sys.path.append("/home/pub/OneAstro-Spec/main/")
 from utils import SpecDataLoader, SpecFeatureExtractor, SpecFeatureLoader, FeatureDataset
+from id_mask_tools import get_id_sel
 from helper import setup_logging
 setup_logging()
 
@@ -59,8 +62,9 @@ class CrossAttentionPool(nn.Module):
         return pooled.squeeze(1)  # (B, D)
     
 class AIONRegressor(nn.Module):
-    def __init__(self, embed_dim=768, hidden_dim=256, output_dim=5, num_heads=8, dropout=0.1):
+    def __init__(self, embed_dim=768, hidden_dim=256, output_dim=5, num_heads=8, dropout=0.1, prior_z=None):
         super().__init__()
+        self.prior_z = prior_z
         self.pool = CrossAttentionPool(embed_dim=embed_dim, num_heads=num_heads)
         self.mlp = nn.Sequential(
             nn.LayerNorm(embed_dim),
@@ -70,9 +74,12 @@ class AIONRegressor(nn.Module):
             nn.Linear(hidden_dim, output_dim)
             )
     def forward(self, x):
-        # x: (B, 256, 768)
+        # x: (B, len, 768)
         x = self.pool(x)   # (B, 768)
         x = self.mlp(x)    # (B, output_dim)
+        if self.prior_z is not None:
+            zmin, zmax = self.prior_z
+            x = zmin + (zmax - zmin) * torch.sigmoid(x)
         return x
 
 def compute_regression_metrics(y_true, y_pred, label_names=None):
@@ -132,7 +139,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     all_pred = np.concatenate(all_pred, axis=0)
     return total_loss, all_true, all_pred
 
-def run_direct_z(data_name, mod, config, max_samples=None):
+def run_direct_z(data, data_name, mod, config={"device":"cuda"}):
     """
     Directly predict redshift z from the pretrained model
     """
@@ -157,13 +164,10 @@ def run_direct_z(data_name, mod, config, max_samples=None):
         if not modality_list:
             raise ValueError("No modalities found to encode.")
         return modality_list
-    loader = SpecDataLoader(data_name)
-    extractor = SpecFeatureExtractor(device=config["device"])
-    data = loader.load_data(name=data_name)
-    chunk_data = loader.chunk_data(batch_size=config["batch_size"],max_samples=max_samples,data=data,)
+
     all_results = []
     running_index = 0
-    for batch_idx, batch_data in enumerate(tqdm(chunk_data, desc="Direct z inference")):
+    for batch_idx, batch_data in enumerate(tqdm(data, desc="Direct z inference")):
         kind = mod_to_kind[mod]
         modalities = extractor.build_modalities(batch_data, kind=kind)
         modality_list = _modalities_dict_to_list(modalities)
@@ -193,7 +197,7 @@ def run_direct_z(data_name, mod, config, max_samples=None):
             torch.cuda.empty_cache()
     return all_results
 
-def run_predict_labels(features, targets, labels, config):
+def run_predict_labels(features, targets, data_name, label_names, config):
     """
     Train + evaluate regression model on AION features.
     """
@@ -210,33 +214,38 @@ def run_predict_labels(features, targets, labels, config):
     val_idx = val_dataset.indices
     test_idx = test_dataset.indices
     # normalization (fit on train only)
-    normalizer = TargetNormalizer()
-    normalizer.fit(targets[train_idx])
-    logger.info(f"Targets: {labels}")
-    logger.info(f"Target mean: {normalizer.mean}")
-    logger.info(f"Target std: {normalizer.std}")
-    targets_norm = normalizer.transform(targets)
-    dataset_norm = FeatureDataset(features, targets_norm, task="regression")
-    train_dataset = torch.utils.data.Subset(dataset_norm, train_idx)
-    val_dataset = torch.utils.data.Subset(dataset_norm, val_idx)
-    test_dataset = torch.utils.data.Subset(dataset_norm, test_idx)
+    if config.get("with_normalization", False):
+        normalizer = TargetNormalizer()
+        normalizer.fit(targets[train_idx])
+        logger.info(f"Target mean: {normalizer.mean}")
+        logger.info(f"Target std: {normalizer.std}")
+        targets_used = normalizer.transform(targets)
+    else:
+        normalizer = None
+        targets_used = targets
+    dataset_used = FeatureDataset(features, targets_used, task="regression")
+    train_dataset = torch.utils.data.Subset(dataset_used, train_idx)
+    val_dataset = torch.utils.data.Subset(dataset_used, val_idx)
+    test_dataset = torch.utils.data.Subset(dataset_used, test_idx)
     # dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True,pin_memory=True,num_workers=CONFIG.get("num_workers", 4))
-    val_loader = DataLoader(val_dataset,batch_size=CONFIG["batch_size"],shuffle=False,pin_memory=True,num_workers=CONFIG.get("num_workers", 4))
-    test_loader = DataLoader(test_dataset,batch_size=CONFIG["batch_size"],shuffle=False,pin_memory=True,num_workers=CONFIG.get("num_workers", 4))
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True,pin_memory=True,num_workers=config.get("num_workers", 4))
+    val_loader = DataLoader(val_dataset,batch_size=config["batch_size"],shuffle=False,pin_memory=True,num_workers=config.get("num_workers", 4))
+    test_loader = DataLoader(test_dataset,batch_size=config["batch_size"],shuffle=False,pin_memory=True,num_workers=config.get("num_workers", 4))
     # trainning model
+    prior_z = None
     model = AIONRegressor(
         embed_dim=features.shape[2],   # 768
-        hidden_dim=CONFIG["hidden_dim"],
+        hidden_dim=config["hidden_dim"],
         output_dim=output_dim,
-        num_heads=CONFIG["num_heads"],
-        dropout=CONFIG["dropout"],
-    ).to(CONFIG["device"])
+        num_heads=config["num_heads"],
+        dropout=config["dropout"],
+        prior_z=prior_z,
+    ).to(config["device"])
     criterion = nn.HuberLoss()
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
+    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", 
-                                                    patience=CONFIG["lr_scheduler_patience"],
-                                                    factor=CONFIG["lr_scheduler_factor"],)
+                                                    patience=config["lr_scheduler_patience"],
+                                                    factor=config["lr_scheduler_factor"],)
     # training loop
     best_val_loss = np.inf
     best_model_state = None
@@ -244,24 +253,23 @@ def run_predict_labels(features, targets, labels, config):
 
     train_losses = []
     val_losses = []
-    
-    for epoch in range(CONFIG["num_epochs"]):
+    for epoch in range(config["num_epochs"]):
         train_loss, train_true, train_pred = run_epoch(model=model,loader=train_loader,
-            criterion=criterion,device=CONFIG["device"],optimizer=optimizer,)
+            criterion=criterion,device=config["device"],optimizer=optimizer,)
         val_loss, val_true, val_pred = run_epoch(model=model,loader=val_loader,
-            criterion=criterion,device=CONFIG["device"],optimizer=None,)
-        train_true = normalizer.inverse_transform(train_true)
-        train_pred = normalizer.inverse_transform(train_pred)
-        val_true = normalizer.inverse_transform(val_true)
-        val_pred = normalizer.inverse_transform(val_pred)
-        train_metrics = compute_regression_metrics(train_true, train_pred, args.labels)
-        val_metrics = compute_regression_metrics(val_true, val_pred, args.labels)
-
+            criterion=criterion,device=config["device"],optimizer=None,)
+        if normalizer is not None:
+            train_true = normalizer.inverse_transform(train_true)
+            train_pred = normalizer.inverse_transform(train_pred)
+            val_true = normalizer.inverse_transform(val_true)
+            val_pred = normalizer.inverse_transform(val_pred)
+        train_metrics = compute_regression_metrics(train_true, train_pred, label_names)
+        val_metrics = compute_regression_metrics(val_true, val_pred, label_names)
         scheduler.step(val_loss)
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         
-        if val_loss < best_val_loss- CONFIG["min_delta"]:
+        if val_loss < best_val_loss- config["min_delta"]:
             best_val_loss = val_loss
             best_model_state = copy.deepcopy(model.state_dict())
             epochs_no_improve = 0
@@ -270,13 +278,13 @@ def run_predict_labels(features, targets, labels, config):
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             msg = (
-                f"Epoch [{epoch+1}/{CONFIG['num_epochs']}] "
+                f"Epoch [{epoch+1}/{config['num_epochs']}] "
                 f"Train Loss: {train_loss:.4f} | "
                 f"Val Loss: {val_loss:.4f}"
             )
             logger.info(msg)
 
-        if epochs_no_improve >= CONFIG["stop_patience"]:
+        if epochs_no_improve >= config["stop_patience"]:
             logger.info(f"Early stopping at epoch {epoch+1} to avoid overfitting")
             break
 
@@ -286,14 +294,14 @@ def run_predict_labels(features, targets, labels, config):
     ## test
     test_loss, test_true, test_pred = run_epoch(model=model,loader=test_loader,
         criterion=criterion,device=config["device"],optimizer=None,)
-    test_true = normalizer.inverse_transform(test_true)
-    test_pred = normalizer.inverse_transform(test_pred)
-    test_metrics = compute_regression_metrics(test_true, test_pred, labels)
+    if normalizer is not None:
+        test_true = normalizer.inverse_transform(test_true)
+        test_pred = normalizer.inverse_transform(test_pred)
+    test_metrics = compute_regression_metrics(test_true, test_pred, label_names)
     logger.info("Test Metrics:")
-    for name in args.labels:
+    for name in label_names:
         m = test_metrics[name]
         logger.info(f"{name}: MAE={m['mae']:.4f} | RMSE={m['rmse']:.4f} | R2={m['r2']:.4f}")
-
     return {"model": model,"normalizer": normalizer,
         "train_idx": np.array(train_idx),"val_idx": np.array(val_idx),"test_idx": np.array(test_idx),
         "train_losses": np.array(train_losses),"val_losses": np.array(val_losses),
@@ -303,10 +311,10 @@ def run_predict_labels(features, targets, labels, config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", nargs="+", type=str, default=["predict_labels"],choices=["predict_labels", "direct_z"], help="tasks to do")
-    parser.add_argument("--data",type = str,  default='provabgs-v2', help="data(dataset)", choices=['provabgs-v2','desi-sv1'])
+    parser.add_argument("--data", type = str,  default='provabgs-v2', help="dataset type", choices=['provabgs-v2','desi-sv1'])
+    parser.add_argument("--masks", nargs="+", default=[None], help="quality mask on the data",)
     parser.add_argument("--mods", nargs="+", type=str, default=["sp"], help="input modality, e.g. sp, im, ph, im+ph, sp+im, sp+im+ph")
-    parser.add_argument("--labels", nargs="+", default=["z"], help="target labels, e.g. z, m_star, z_mw, t_age, sfr",)
-    parser.add_argument("--quality", default=None, help="quality cut on the data",)
+    parser.add_argument("--labels", nargs="+", default=["z"], help="target label, e.g. z, m_star, z_mw, t_age, sfr",)
     parser.add_argument("--output", type=str, default=None, help="path to results",)
     parser.add_argument("--config", type=str, default=None, help="path to configuration files",)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite file")
@@ -329,56 +337,81 @@ if __name__ == '__main__':
         "sp+ph": ("desi_spectrum", "legacy_photometry"),
         "sp+im+ph": ("desi_spectrum", "legacy_image", "legacy_photometry"),
     }
-    
-    if args.quality
 
-    for mod, quality in args.mods:
-        with open(config_fn, "r") as f: 
-            CONFIG = json.load(f)["datasets"][args.data]
-        CONFIG["result_dir"] = os.path.join(output_path, "result", f"{args.data}")
-        CONFIG["result_prefix"] = f"{args.data}_{mod}_{'_'.join(args.labels)}"
-        os.makedirs(CONFIG["result_dir"], exist_ok=True)
+    with open(config_fn, "r") as f:
+        BASE_CONFIG = json.load(f)["datasets"][args.data]
 
-        if "direct_z" in  args.tasks:
-            logger.info(f"Running direct inference of redshift z for {args.data} with {mod}")
-            all_results = run_direct_z(data_name=args.data,mod=mod,config=CONFIG,max_samples=None,)
-            pred_path = os.path.join(CONFIG["result_dir"], f"{args.data}_{mod}_direct_z_test_predict.npz")
-            true_z = np.array([r["z_true"] for r in all_results])
-            pred_z = np.array([r[f"z_pred"] for r in all_results])
-            metrics = compute_regression_metrics(true_z, pred_z, 'z')
-            save_dict = {}
-            for key in all_results[0].keys():
-                save_dict[key] = np.array([r[key] for r in all_results])
-            np.savez(pred_path, **save_dict)
-            logger.info(f"Saved direct z predictions to {pred_path}")
-            logger.info(
-                f"[direct_z][{mod}] "
-                f"MAE={metrics['z']['mae']:.4f} | "
-                f"RMSE={metrics['z']['rmse']:.4f} | "
-                f"mean|dz/(1+z)|={metrics['z']['mean_abs_dz_norm']:.4f} | "
-                f"std(dz/(1+z))={metrics['z']['std_dz_norm']:.4f}")
+    for mod in args.mods:
+        if "direct_z" in args.tasks:
+            # run direct z inference
+            loader = SpecDataLoader(args.data)
+            extractor = SpecFeatureExtractor(device=BASE_CONFIG["device"])
+            for mask_type in args.masks:
+                CONFIG = copy.deepcopy(BASE_CONFIG)
+                CONFIG["result_dir"] = os.path.join(output_path, "result", f"{args.data}", "predict")
+                os.makedirs(CONFIG["result_dir"], exist_ok=True)
+                id_sel = None
+                suffix = ""
+                if mask_type is not None and mask_type != "None":
+                    suffix = f"_{mask_type}"
+                    id_sel = get_id_sel(mask_type, args.data, CONFIG)
+                logger.info(f"Running direct inference of redshift z for {args.data} with {mod}{suffix}")
+                pred_path = os.path.join(CONFIG["result_dir"],f"{args.data}_{mod}_direct_z{suffix}.npz")
+                if os.path.exists(pred_path) and not args.overwrite:
+                    logger.info(f"Skipping: {pred_path}")
+                    continue
+                data = loader.load_data(name=args.data, id_sel=id_sel)
+                logger.info(f"data size: {len(data)}")
+                chunk_data = loader.chunk_data(batch_size=CONFIG["batch_size"],max_samples=None,data=data,)
+                all_results = run_direct_z(chunk_data, data_name=args.data, mod=mod, config=CONFIG)
+                true_z = np.array([r["z_true"] for r in all_results])
+                pred_z = np.array([r[f"z_pred"] for r in all_results])
+                metrics = compute_regression_metrics(true_z, pred_z, ['z'])
+                save_dict = {}
+                for key in all_results[0].keys():
+                    save_dict[key] = np.array([r[key] for r in all_results])
+                np.savez(pred_path, **save_dict)
+                logger.info(f"Saved direct z predictions to {pred_path}")
 
         if "predict_labels" in args.tasks:
-            logger.info(f"Running predict labels for {args.data} with {mod}")
-            CONFIG["feature_dir"] = os.path.join(output_path, "features", f"{args.data}")
-            os.makedirs(CONFIG["feature_dir"], exist_ok=True)
             FEATURE = SpecFeatureLoader(args.data)
-            feature_fn = os.path.join(CONFIG["feature_dir"], f"{args.data}_{mod}_features.npz")
-            features, targets = FEATURE.load_features(kind=mod_to_kind[mod], 
-                                                      label_names=args.labels, label_dtype="float",
-                                                      batch_size=CONFIG["batch_size"],
-                                                      feature_fn=feature_fn,)
-            logger.info(f"Features shape: {features.shape}")
-            logger.info(f"Targets shape: {targets.shape}")
-            all_results = run_predict_labels(features=features, targets=targets, labels=args.labels,config=CONFIG)
-            suffix = None
-            loss_path = os.path.join(CONFIG["result_dir"],f"{CONFIG['result_prefix']}_loss_history.npz")
-            np.savez(loss_path, train_losses=np.array(all_results['train_losses']),val_losses=np.array(all_results['val_losses']))
-            logger.info(f"Saved loss history to {loss_path}")
-            model_path = os.path.join(CONFIG["result_dir"], f"{CONFIG['result_prefix']}_best.pt")
-            torch.save(all_results['model'].state_dict(), model_path)
-            logger.info(f"Saved best model to {model_path}")
-            pred_path = os.path.join(CONFIG["result_dir"],f"{CONFIG['result_prefix']}_test_predict.npz")
-            np.savez(pred_path,test_true=all_results['test_true'],test_pred=all_results['test_pred'],label_names=np.array(args.labels))
-            logger.info(f"Saved test predictions to {pred_path}")
-        
+            for mask_type in args.masks:
+                CONFIG = copy.deepcopy(BASE_CONFIG)
+                CONFIG["result_dir"] = os.path.join(output_path, "result", f"{args.data}", "predict")
+                CONFIG["feature_dir"] = os.path.join(output_path, "features", f"{args.data}")
+                os.makedirs(CONFIG["result_dir"], exist_ok=True)
+                os.makedirs(CONFIG["feature_dir"], exist_ok=True)
+                id_sel = None
+                suffix = ""
+                if mask_type is not None and mask_type != "None":
+                    suffix = f"_{mask_type}"
+                    id_sel = get_id_sel(mask_type, args.data, CONFIG)
+                logger.info(f"Running predict labels for {args.data} with {mod}{suffix}")
+                pred_path = os.path.join(CONFIG["result_dir"],f"{args.data}_{mod}_predict_{'_'.join(args.labels)}{suffix}.npz")
+                if os.path.exists(pred_path) and not args.overwrite:
+                    logger.info(f"Skipping: {pred_path}")
+                    continue
+                feature_fn = os.path.join(CONFIG["feature_dir"], f"features_{args.data}_{mod}.npz")
+                features, targets = FEATURE.load_features(kind=mod_to_kind[mod], id_sel=id_sel,
+                                                        label_names=args.labels, label_dtype="float",
+                                                        batch_size=CONFIG["batch_size"],
+                                                        feature_fn=feature_fn,)
+                logger.info(f"Features shape: {features.shape}")
+                logger.info(f"Targets shape: {targets.shape}")
+                all_results = run_predict_labels(features=features, targets=targets, data_name= args.data, label_names=args.labels,config=CONFIG)
+                # loss_path = os.path.join(CONFIG["result_dir"],f"{CONFIG['result_prefix']}_loss.npz")
+                # np.savez(loss_path, train_losses=np.array(all_results['train_losses']),val_losseslnp.array(all_results['val_losses']))
+                # logger.info(f"Saved loss history to {loss_path}")
+                # model_path = os.path.join(CONFIG["result_dir"], f"{CONFIG['result_prefix']}_best.pt")
+                # torch.save(all_results['model'].state_dict(), model_path)
+                # logger.info(f"Saved best model to {model_path}")
+                os.makedirs(CONFIG["result_dir"], exist_ok=True)
+                np.savez(pred_path,test_true=all_results['test_true'],test_pred=all_results['test_pred'], 
+                        label_names=np.array(args.labels), feature_shape=np.array(features.shape), target_shape=np.array(targets.shape),)
+                logger.info(f"Saved test predictions to {pred_path}")
+        if "predict_labels" in args.tasks:
+            del FEATURE
+        if "direct_z" in args.tasks:
+            del loader, extractor
+        gc.collect()
+        torch.cuda.empty_cache()

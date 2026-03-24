@@ -2,6 +2,7 @@
 To activate enviroment
 conda activate SpecFun
 '''
+import gc
 import os, sys
 ## set hugging face to off-line
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -10,6 +11,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 import json
 import copy
+import itertools
 import logging
 import argparse
 import numpy as np
@@ -20,11 +22,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, f1_score
+from torch.utils.data import Dataset, DataLoader, random_split
 # import seaborn as sns
 
 sys.path.append("..")
 from utils import SpecDataLoader, SpecFeatureExtractor, FeatureDataset, SpecFeatureLoader
 from helper import setup_logging
+from id_mask_tools import get_id_sel
 setup_logging()
 
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +62,6 @@ class CrossAttentionPool(nn.Module):
             num_heads=num_heads,
             batch_first=True,
         )
-
     def forward(self, x):
         # x: (B, T, D)
         B = x.size(0)
@@ -77,7 +80,6 @@ class AIONClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes),
         )
-
     def forward(self, x):
         x = self.pool(x)      # (B, D)
         logits = self.mlp(x)  # (B, C)
@@ -94,7 +96,6 @@ def compute_classification_metrics(y_true, y_pred):
         "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
     }
     return metrics
-
 
 def run_epoch(model, loader, criterion, device, optimizer=None):
     if optimizer is not None:
@@ -128,13 +129,110 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     all_prob = np.concatenate(all_prob, axis=0)
     return total_loss, all_true, all_pred, all_prob
 
+def run_classification(features, targets, data_name, label_names, config):
+    """
+    Train + evaluate classification model on AION features.
+    """
+    targets = np.asarray(targets)
+    if targets.ndim > 1 and targets.shape[1] == 1:
+        targets = targets.ravel()
+
+    label_encoder = LabelEncoder()
+    label_encoder.fit(targets)
+    targets_encoded = label_encoder.transform(targets)
+    num_classes = len(label_encoder.classes_)
+    logger.info(f"Targets: {label_names}")
+    logger.info(f"Classes: {label_encoder.classes_}")
+    dataset = FeatureDataset(features, targets_encoded, task="classification")
+    train_size = int(config["train_ratio"] * len(dataset))
+    val_size = int(config["val_ratio"] * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+    train_idx = train_dataset.indices
+    val_idx = val_dataset.indices
+    test_idx = test_dataset.indices
+    # dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True,pin_memory=True,num_workers=config.get("num_workers", 4))
+    val_loader = DataLoader(val_dataset,batch_size=config["batch_size"],shuffle=False,pin_memory=True,num_workers=config.get("num_workers", 4))
+    test_loader = DataLoader(test_dataset,batch_size=config["batch_size"],shuffle=False,pin_memory=True,num_workers=config.get("num_workers", 4))
+    model = AIONClassifier(
+        embed_dim=features.shape[2],
+        hidden_dim=config["hidden_dim"],
+        num_classes=num_classes,
+        num_heads=config["num_heads"],
+        dropout=config["dropout"],
+    ).to(config["device"])
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        patience=config["lr_scheduler_patience"],
+        factor=config["lr_scheduler_factor"],
+    )
+    # training loop
+    best_val_loss = np.inf
+    best_model_state = None
+    epochs_no_improve = 0
+
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(config["num_epochs"]):
+        train_loss, train_true, train_pred, train_prob= run_epoch(model=model,loader=train_loader,
+            criterion=criterion,device=config["device"],optimizer=optimizer,)
+        val_loss, val_true, val_pred, val_prob = run_epoch(model=model,loader=val_loader,
+            criterion=criterion,device=config["device"],optimizer=None,)
+        train_metrics = compute_classification_metrics(train_true, train_pred)
+        val_metrics = compute_classification_metrics(val_true, val_pred)
+        scheduler.step(val_loss)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        if val_loss < best_val_loss - config["min_delta"]:
+            best_val_loss = val_loss
+            best_model_state = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            msg = (
+                f"Epoch [{epoch+1}/{config['num_epochs']}] "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | "
+            )
+            logger.info(msg)
+
+        if epochs_no_improve >= config["stop_patience"]:
+            logger.info(f"Early stopping at epoch {epoch+1} to avoid overfitting")
+            break
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    test_loss, test_true, test_pred, test_prob = run_epoch(model=model,loader=test_loader,
+        criterion=criterion,device=config["device"],optimizer=None,)
+    test_metrics = compute_classification_metrics(test_true, test_pred)
+    logger.info("Test Metrics:")
+    logger.info(f"Accuracy   = {test_metrics['accuracy']:.4f}")
+    logger.info(f"Macro F1   = {test_metrics['macro_f1']:.4f}")
+    logger.info(f"Weighted F1= {test_metrics['weighted_f1']:.4f}")
+    return {"model": model, "classes": np.array(label_encoder.classes_),
+        "train_idx": np.array(train_idx),"val_idx": np.array(val_idx),"test_idx": np.array(test_idx),
+        "train_losses": np.array(train_losses),"val_losses": np.array(val_losses),
+        "test_true": np.array(test_true),"test_pred": np.array(test_pred),"test_prob": np.array(test_prob),"test_metrics": test_metrics,}
+
 #####################################################################################################################################
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tasks", nargs="+", type=str, default=["classfication"],choices=["classfication"], help="tasks")
-    parser.add_argument("--data",type = str,  default='provabgs', help="dataset", choices=['provabgs','desi-sv1'])
+    parser.add_argument("--tasks", nargs="+", type=str, default=["classification"],choices=["classification"], help="tasks to do")
+    parser.add_argument("--data", type = str,  default='desi-sv1', help="dataset type", choices=['provabgs-v2','desi-sv1'])
+    # parser.add_argument("--masks", nargs="+", default=[None], help="quality mask on the data",)
     parser.add_argument("--mods", nargs="+", type=str, default=["sp"], help="input modality, e.g. sp, im, ph, im+ph, sp+im, sp+im+ph")
-    parser.add_argument("--labels", nargs="+", default=["z"], help="target labels, e.g. type,  possible (z, m_star, z_mw, t_age, sfr")
+    parser.add_argument("--labels", nargs="+", default=["type"], help="target label, e.g. type",)
     parser.add_argument("--output", type=str, default=None, help="path to results",)
     parser.add_argument("--config", type=str, default=None, help="path to configuration files",)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite file")
@@ -147,8 +245,9 @@ if __name__ == '__main__':
     # default setting
     output_path = args.output or "/mnt/oss_nanhu100TB/default/zjq/results/SpecFun"
     config_fn = args.config or "./config/prediction_config.json"
-    use_saved_feature = False
-    
+
+    args.masks = [f"R_cut_{cut:.1f}" for cut in np.arange(16.5, 25., 0.2)]
+
     mod_to_kind = {
         "sp": ("desi_spectrum",),
         "im": ("legacy_image",),
@@ -159,163 +258,48 @@ if __name__ == '__main__':
         "sp+im+ph": ("desi_spectrum", "legacy_image", "legacy_photometry"),
     }
     
+    with open(config_fn, "r") as f:
+        BASE_CONFIG = json.load(f)["datasets"][args.data]
 
     for mod in args.mods:
-        with open(config_fn, "r") as f: 
-            CONFIG = json.load(f)["datasets"][args.data]
-        CONFIG["result_dir"] = os.path.join(output_path, "result", f"{args.data}")
-        CONFIG["result_prefix"] = f"{args.data}_{mod}_{'_'.join(args.labels)}"
-        os.makedirs(CONFIG["result_dir"], exist_ok=True)
-
-        
-        if "classfication" in args.tasks:
-            logger.info(f"Running classification for {args.data} with {mod}")
+        # FEATURE loader for each modality, they will share the same id_sel and label_names
+        FEATURE = SpecFeatureLoader(args.data)
+        for task, mask_type in itertools.product(args.tasks, args.masks):
+            CONFIG = copy.deepcopy(BASE_CONFIG)
+            CONFIG["result_dir"] = os.path.join(output_path, "result", f"{args.data}", "class")
             CONFIG["feature_dir"] = os.path.join(output_path, "features", f"{args.data}")
+            id_sel = None
+            suffix = ""
+            if mask_type is not None and mask_type != "None":
+                suffix = f"_{mask_type}"
+                id_sel = get_id_sel(mask_type, args.data, CONFIG)
+            logger.info(f"Running classification for {args.data} with {mod}{suffix}")
+            pred_path = os.path.join(CONFIG["result_dir"], f"{args.data}_{mod}_class_{'_'.join(args.labels)}{suffix}.npz")
+            os.makedirs(CONFIG["result_dir"], exist_ok=True)
             os.makedirs(CONFIG["feature_dir"], exist_ok=True)
-            FEATURE = SpecFeatureLoader(args.data)
-            feature_fn = os.path.join(CONFIG["feature_dir"], f"{args.data}_{mod}_features.npz")
-            features, targets = FEATURE.load_features(kind=mod_to_kind[mod], 
-                                                      label_names=args.labels, label_dtype="float",
+            if os.path.exists(pred_path) and not args.overwrite:
+                logger.info(f"Skipping: {pred_path}")
+                continue
+            feature_fn = os.path.join(CONFIG["feature_dir"], f"features_{args.data}_{mod}.npz")
+            features, targets = FEATURE.load_features(kind=mod_to_kind[mod], id_sel=id_sel,
+                                                      label_names=args.labels, label_dtype="object",
                                                       batch_size=CONFIG["batch_size"],
                                                       feature_fn=feature_fn,)
             logger.info(f"Features shape: {features.shape}")
             logger.info(f"Targets shape: {targets.shape}")
-            
-            # Handle single or multiple labels for classification
-            if targets.ndim > 1 and targets.shape[1] == 1:
-                targets = targets.ravel()
-            
-            # Encode labels to [0, ..., C-1]
-            label_encoder = LabelEncoder()
-            label_encoder.fit(targets)
-            targets_encoded = label_encoder.transform(targets)
-            num_classes = len(label_encoder.classes_)
-            
-            logger.info(f"Number of classes: {num_classes}")
-            logger.info(f"Classes: {label_encoder.classes_}")
-            
-            # Create dataset with encoded labels
-            dataset = FeatureDataset(features, targets_encoded, task="classification")
-            
-            # Train/val/test split
-            train_size = int(CONFIG["train_ratio"] * len(dataset))
-            val_size = int(CONFIG["val_ratio"] * len(dataset))
-            test_size = len(dataset) - train_size - val_size
-            
-            train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-                dataset, [train_size, val_size, test_size],
-                generator=torch.Generator().manual_seed(42),
-            )
-            
-            train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], 
-                                      shuffle=True, pin_memory=True,
-                                      num_workers=CONFIG.get("num_workers", 4))
-            val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"],
-                                    shuffle=False, pin_memory=True,
-                                    num_workers=CONFIG.get("num_workers", 4))
-            test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"],
-                                     shuffle=False, pin_memory=True,
-                                     num_workers=CONFIG.get("num_workers", 4))
-            
-            # Initialize model
-            model = AIONClassifier(
-                embed_dim=features.shape[2],   # 768
-                hidden_dim=CONFIG["hidden_dim"],
-                num_classes=num_classes,
-                num_heads=CONFIG["num_heads"],
-                dropout=CONFIG["dropout"],
-            ).to(CONFIG["device"])
-            
-            criterion = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
-                                                            patience=CONFIG["lr_scheduler_patience"],
-                                                            factor=CONFIG["lr_scheduler_factor"])
-            
-            best_val_loss = np.inf
-            best_model_state = None
-            epochs_no_improve = 0
-            
-            train_losses = []
-            val_losses = []
-            
-            # Training loop
-            for epoch in range(CONFIG["num_epochs"]):
-                train_loss, train_true, train_pred, train_prob = run_epoch(
-                    model=model,
-                    loader=train_loader,
-                    criterion=criterion,
-                    device=CONFIG["device"],
-                    optimizer=optimizer,
-                )
-                
-                val_loss, val_true, val_pred, val_prob = run_epoch(
-                    model=model,
-                    loader=val_loader,
-                    criterion=criterion,
-                    device=CONFIG["device"],
-                    optimizer=None,
-                )
-                
-                train_metrics = compute_classification_metrics(train_true, train_pred)
-                val_metrics = compute_classification_metrics(val_true, val_pred)
-                
-                scheduler.step(val_loss)
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-                
-                if val_loss < best_val_loss - CONFIG["min_delta"]:
-                    best_val_loss = val_loss
-                    best_model_state = copy.deepcopy(model.state_dict())
-                    epochs_no_improve = 0
-                else:
-                    epochs_no_improve += 1
-                
-                if (epoch + 1) % 5 == 0 or epoch == 0:
-                    msg = (
-                        f"Epoch [{epoch+1}/{CONFIG['num_epochs']}] "
-                        f"Train Loss: {train_loss:.4f} | Train Acc: {train_metrics['accuracy']:.4f} | "
-                        f"Val Loss: {val_loss:.4f} | Val Acc: {val_metrics['accuracy']:.4f}"
-                    )
-                    logger.info(msg)
-                
-                if epochs_no_improve >= CONFIG["stop_patience"]:
-                    logger.info(f"Early stopping at epoch {epoch+1} to avoid overfitting")
-                    break
-            
-            # Load best model and evaluate on test set
-            model.load_state_dict(best_model_state)
-            
-            test_loss, test_true, test_pred, test_prob = run_epoch(
-                model=model,
-                loader=test_loader,
-                criterion=criterion,
-                device=CONFIG["device"],
-                optimizer=None,
-            )
-            
-            test_metrics = compute_classification_metrics(test_true, test_pred)
-            
-            logger.info("=" * 60)
-            logger.info("Test Metrics:")
-            logger.info(f"Accuracy: {test_metrics['accuracy']:.4f}")
-            logger.info(f"Macro F1: {test_metrics['macro_f1']:.4f}")
-            logger.info(f"Weighted F1: {test_metrics['weighted_f1']:.4f}")
-            # logger.info("Confusion Matrix:")
-            # cm = np.array(test_metrics['confusion_matrix'])
-            # logger.info(str(cm))
-            # logger.info("=" * 60)
-            
+            all_results = run_classification(features=features, targets=targets, data_name = args.data, label_names=args.labels, config=CONFIG)
             # Save results
-            loss_path = os.path.join(CONFIG["result_dir"],
-                                    f"{CONFIG['result_prefix']}_loss_history.npz")
-            np.savez(loss_path, train_losses=np.array(train_losses),val_losses=np.array(val_losses))
-            logger.info(f"Saved loss history to {loss_path}")
-            model_path = os.path.join(CONFIG["result_dir"],f"{CONFIG['result_prefix']}_best.pt")
-            torch.save(model.state_dict(), model_path)
-            logger.info(f"Saved best model to {model_path}")
-            pred_path = os.path.join(CONFIG["result_dir"],f"{CONFIG['result_prefix']}_test_predictions.npz")
-            np.savez(pred_path,test_true=test_true,test_pred=test_pred,test_prob=test_prob,
-                     label_names=np.array(args.labels),
-                     classes=label_encoder.classes_,metrics=test_metrics)
+            # loss_path = os.path.join(CONFIG["result_dir"],
+                                    # f"{CONFIG['result_prefix']}_loss_history.npz")
+            # np.savez(loss_path, train_losses=np.array(train_losses),val_losses=np.array(val_losses))
+            # logger.info(f"Saved loss history to {loss_path}")
+            # model_path = os.path.join(CONFIG["result_dir"],f"{CONFIG['result_prefix']}_best.pt")
+            # torch.save(all_results["model"].state_dict(), model_path)
+            # logger.info(f"Saved best model to {model_path}")
+            np.savez(pred_path, classes = all_results["classes"], 
+                     metrics=all_results["test_metrics"],test_true=all_results["test_true"],test_pred=all_results["test_pred"],test_prob=all_results["test_prob"],
+                     label_names=np.array(args.labels), feature_shape=np.array(features.shape), target_shape=np.array(targets.shape))
             logger.info(f"Saved test predictions to {pred_path}")
+        del FEATURE
+        gc.collect()
+        torch.cuda.empty_cache()

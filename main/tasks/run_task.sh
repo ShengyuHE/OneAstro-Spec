@@ -20,22 +20,28 @@ MODS=("sp" "im" "ph" "im+ph" "sp+im" "sp+ph" "sp+im+ph")
 run_task() {
     case $1 in
         extract)
-            python extract_features.py --task extract_feature --data $DATA --mod "${MODS[@]}" --overwrite
+            # --overwrite
+            CUDA_VISIBLE_DEVICES=0 python extract_features.py --tasks extract_feature --data "$DATA" --mods "${MODS[@]}"
             ;;
         mask)
-            python quality_ids.py --tasks snr_quality --data $DATA --overwrite
+            # MASK="snr_quality"
+            MASKS=("R_cut") # spec_snr, mag_cut, zq_cut, R_cut
+            CUDA_VISIBLE_DEVICES=0 python quality_ids.py  --masks "${MASKS[@]}" --data $DATA --overwrite
             ;;
         predict)
+            TASK="predict_labels" # predict_labels, direct_z
             LABELS=("z")
             # LABELS=("z" "m_star" "z_mw" "t_age" "sfr")
-            python prediction.py --task predict_labels --data $DATA --mod "${MODS[@]}" --labels "${LABELS[@]}"
+            MASKS=("spec_snr_mean_cut1" "spec_snr_mean_cut2" "spec_snr_mean_cut3" "spec_snr_mean_cut4")
+            CUDA_VISIBLE_DEVICES=0 python prediction.py --tasks $TASK --data $DATA --mods "${MODS[@]}" --labels "${LABELS[@]}" --masks "${MASKS[@]}"
             # for lab in "${LABELS[@]}"; do
-            #     python prediction.py --data provabgs-v2 --mod "${MODS[@]}" --labels "$lab"
-            # done    
+                # CUDA_VISIBLE_DEVICES=0 python prediction.py --data provabgs-v2 --mod "${MODS[@]}" --labels "$lab"
+            # done
             ;;
         class)
-            LABEL="type"
-            python classification.py --task classfication --data $DATA --mod "${MODS[@]}" --labels $LABEL 
+            TASK="classification" # predict_labels, direct_z
+            LABELS=("type")
+            CUDA_VISIBLE_DEVICES=3 python classification.py --tasks $TASK --data $DATA --mods "${MODS[@]}" --labels "${LABELS[@]}"
             ;;            
     esac
 }

@@ -8,7 +8,7 @@
       "train_ratio": 0.7,
       "val_ratio": 0.15,
       "num_epochs": 50,
-      "dropout": 0.3,
+      "dropout": 0.4,
       "learning_rate": 1e-4, 
       "hidden_dim": 64,
       "num_heads": 8,
@@ -16,7 +16,8 @@
       "stop_patience": 10,
       "lr_scheduler_patience": 5,
       "lr_scheduler_factor": 0.5,
-      "default_labels": ["z", "m_star", "z_mw", "t_age", "sfr"]
+      "default_labels": ["z", "m_star", "z_mw", "t_age", "sfr"],
+      "with_normalization": true
     },
 
     "desi-sv1": {
@@ -25,7 +26,7 @@
       "train_ratio": 0.7,
       "val_ratio": 0.15,
       "num_epochs": 50,
-      "dropout": 0.3,
+      "dropout": 0.4,
       "learning_rate": 1e-4, 
       "hidden_dim": 64,
       "num_heads": 8,
@@ -33,7 +34,8 @@
       "stop_patience": 10,
       "lr_scheduler_patience": 5,
       "lr_scheduler_factor": 0.5,
-      "default_labels": ["z"]
+      "default_labels": ["z"],
+      "with_normalization": false
     }
   }
 }
